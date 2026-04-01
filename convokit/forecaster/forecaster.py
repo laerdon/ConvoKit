@@ -6,7 +6,9 @@ import pandas as pd
 import numpy as np
 from matplotlib import pyplot as plt
 
-# Define a namedtuple template to represent conversational context tuples
+# define a namedtuple template to represent conversational context tuples.
+# this alias is kept for backwards compatibility; decision policies should
+# accept the same structure.
 ContextTuple = namedtuple(
     "ContextTuple", ["context", "current_utterance", "future_context", "conversation_id"]
 )
