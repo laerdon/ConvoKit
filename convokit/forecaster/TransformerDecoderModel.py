@@ -14,6 +14,7 @@ import numpy as np
 from sklearn.metrics import roc_curve
 from .forecasterModel import ForecasterModel
 from .TransformerForecasterConfig import TransformerForecasterConfig
+from convokit.decisionpolicy import ThresholdDecisionPolicy
 import shutil
 
 
@@ -72,7 +73,9 @@ class TransformerDecoderModel(ForecasterModel):
         config=DEFAULT_CONFIG,
         system_msg=None,
         question_msg=None,
+        decision_policy=None,
     ):
+        super().__init__(decision_policy=decision_policy)
         self.max_seq_length = 4_096 * 2
         self.model, tokenizer = FastLanguageModel.from_pretrained(
             model_name=model_name_or_path,
@@ -100,13 +103,23 @@ class TransformerDecoderModel(ForecasterModel):
                 "Will the above conversation derail into a personal attack now or at any point in the future? "
                 "Strictly start your answer with Yes or No, otherwise the answer is invalid."
             )
-        self.best_threshold = 0.5
 
         if not os.path.exists(config.output_dir):
             os.makedirs(config.output_dir)
         self.config = config
 
         return
+
+    @property
+    def best_threshold(self):
+        if hasattr(self.decision_policy, "threshold"):
+            return self.decision_policy.threshold
+        return None
+
+    @best_threshold.setter
+    def best_threshold(self, value):
+        if hasattr(self.decision_policy, "threshold"):
+            self.decision_policy.threshold = float(value)
 
     def _context_mode(self, context):
         """
@@ -218,7 +231,7 @@ class TransformerDecoderModel(ForecasterModel):
         print(f"There are {len(dataset)} samples")
         return Dataset.from_list(dataset)
 
-    def fit(self, train_contexts, val_contexts):
+    def fit_belief_estimator(self, train_contexts, val_contexts=None):
         """
         Fine-tune the TransformerDecoder model using LoRA and save the best model based on validation performance.
 
@@ -282,7 +295,6 @@ class TransformerDecoderModel(ForecasterModel):
             ),
         )
         trainer.train()
-        _ = self._tune_threshold(self, val_contexts)
         return
 
     def _tune_threshold(self, val_contexts):
@@ -310,7 +322,8 @@ class TransformerDecoderModel(ForecasterModel):
         checkpoints = [cp for cp in os.listdir(self.config.output_dir) if "checkpoint-" in cp]
         if checkpoints == []:
             checkpoints.append("zero-shot")
-        best_val_accuracy = 0
+        best_val_accuracy = -1
+        best_checkpoint = checkpoints[0]
         val_convo_ids = set()
         utt2convo = {}
         val_labels_dict = {}
@@ -334,7 +347,7 @@ class TransformerDecoderModel(ForecasterModel):
             FastLanguageModel.for_inference(self.model)
             utt2score = {}
             for context in tqdm(val_contexts):
-                utt_score, _ = self._predict(context)
+                utt_score = self.score(context)
                 utt_id = context.current_utterance.id
                 utt2score[utt_id] = utt_score
             # for each CONVERSATION, whether or not it triggers will be effectively determined by what the highest score it ever got was
@@ -392,26 +405,7 @@ class TransformerDecoderModel(ForecasterModel):
         )
         return best_config
 
-    def _predict(self, context, threshold=None):
-        """
-        Run inference on a single context using the fine-tuned TransformerDecoder model.
-
-        This method prepares the input from the given context, generates a single-token
-        prediction (either "Yes" or "No"), and computes the softmax probability for "Yes".
-        The output is a confidence score and a binary prediction based on the given or
-        default threshold.
-
-        :param context: A context tuple containing the current utterance and conversation history.
-        :param threshold: (Optional) A float threshold for converting the predicted probability into a binary label.
-            If not provided, `self.best_threshold` is used.
-
-        :return: A tuple (`utt_score`, `utt_pred`), where:
-            - `utt_score` is the softmax probability assigned to "Yes"
-            - `utt_pred` is the binary prediction (1 if `utt_score > threshold`, else 0)
-        """
-        # Enabling inference with different checkpoints to _tune_best_val_accuracy
-        if not threshold:
-            threshold = self.best_threshold
+    def score(self, context) -> float:
         FastLanguageModel.for_inference(self.model)
         context_utts = self._context_mode(context)
         inputs = self._tokenize(context_utts).to(self.config.device)
@@ -432,8 +426,43 @@ class TransformerDecoderModel(ForecasterModel):
         utt_score = F.softmax(torch.tensor([yes_logit, no_logit], dtype=torch.float32), dim=0)[
             0
         ].item()
-        utt_pred = int(utt_score > threshold)
+        return utt_score
+
+    def _predict(self, context, threshold=None):
+        """
+        Run inference on a single context using the fine-tuned TransformerDecoder model.
+
+        This method prepares the input from the given context, generates a single-token
+        prediction (either "Yes" or "No"), and computes the softmax probability for "Yes".
+        The output is a confidence score and a binary prediction based on the given or
+        default threshold.
+
+        :param context: A context tuple containing the current utterance and conversation history.
+        :param threshold: (Optional) A float threshold for converting the predicted probability into a binary label.
+            If not provided, `self.best_threshold` is used.
+
+        :return: A tuple (`utt_score`, `utt_pred`), where:
+            - `utt_score` is the softmax probability assigned to "Yes"
+            - `utt_pred` is the binary prediction (1 if `utt_score > threshold`, else 0)
+        """
+        utt_score = self.score(context)
+        # keep threshold override for backward compatibility.
+        if threshold is not None:
+            utt_pred = int(utt_score > threshold)
+        else:
+            utt_pred = self.decision_policy.decide(context, self.score)
         return utt_score, utt_pred
+
+    def fit_decision_policy(self, contexts, val_contexts=None):
+        if (
+            val_contexts is not None
+            and isinstance(self.decision_policy, ThresholdDecisionPolicy)
+        ):
+            return self._tune_threshold(val_contexts)
+        return super().fit_decision_policy(contexts, val_contexts)
+
+    def fit(self, contexts, val_contexts=None):
+        return super().fit(contexts, val_contexts)
 
     def transform(self, contexts, forecast_attribute_name, forecast_prob_attribute_name):
         """

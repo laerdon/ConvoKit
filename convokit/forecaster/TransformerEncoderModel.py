@@ -17,6 +17,7 @@ from tqdm import tqdm
 from sklearn.metrics import roc_curve
 from .forecasterModel import ForecasterModel
 from .TransformerForecasterConfig import TransformerForecasterConfig
+from convokit.decisionpolicy import ThresholdDecisionPolicy
 import shutil
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -43,15 +44,14 @@ class TransformerEncoderModel(ForecasterModel):
     :param config: (Optional) TransformerForecasterConfig object containing parameters for training and evaluation.
     """
 
-    def __init__(self, model_name_or_path, config=DEFAULT_CONFIG):
-        super().__init__()
+    def __init__(self, model_name_or_path, config=DEFAULT_CONFIG, decision_policy=None):
+        super().__init__(decision_policy=decision_policy)
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_name_or_path,
             model_max_length=512,
             truncation_side="left",
             padding_side="right",
         )
-        self.best_threshold = 0.5
         model_config = AutoConfig.from_pretrained(
             model_name_or_path, num_labels=2, problem_type="single_label_classification"
         )
@@ -62,6 +62,17 @@ class TransformerEncoderModel(ForecasterModel):
             os.makedirs(config.output_dir)
         self.config = config
         return
+
+    @property
+    def best_threshold(self):
+        if hasattr(self.decision_policy, "threshold"):
+            return self.decision_policy.threshold
+        return None
+
+    @best_threshold.setter
+    def best_threshold(self, value):
+        if hasattr(self.decision_policy, "threshold"):
+            self.decision_policy.threshold = float(value)
 
     def _context_mode(self, context):
         """
@@ -153,11 +164,11 @@ class TransformerEncoderModel(ForecasterModel):
 
     @torch.inference_mode
     @torch.no_grad
-    def _predict(
+    def _score_dataset(
         self,
         dataset,
         model=None,
-        threshold=0.5,
+        threshold=None,
         forecast_prob_attribute_name="forecast_prob",
         forecast_attribute_name="forecast",
     ):
@@ -179,6 +190,8 @@ class TransformerEncoderModel(ForecasterModel):
         """
         if not model:
             model = self.model.to(self.config.device)
+        if threshold is None:
+            threshold = self.best_threshold if self.best_threshold is not None else 0.5
         utt_ids = []
         preds = []
         scores = []
@@ -197,6 +210,26 @@ class TransformerEncoderModel(ForecasterModel):
         return pd.DataFrame(
             {forecast_attribute_name: preds, forecast_prob_attribute_name: scores}, index=utt_ids
         )
+
+    @torch.inference_mode
+    @torch.no_grad
+    def score(self, context) -> float:
+        self.model.eval()
+        context_utts = self._context_mode(context)
+        tokenized_context = self._tokenize(context_utts)
+        input_ids = (
+            torch.tensor(tokenized_context["input_ids"], dtype=torch.long)
+            .to(self.config.device)
+            .reshape([1, -1])
+        )
+        attention_mask = (
+            torch.tensor(tokenized_context["attention_mask"], dtype=torch.long)
+            .to(self.config.device)
+            .reshape([1, -1])
+        )
+        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
+        probs = F.softmax(outputs.logits, dim=-1)
+        return probs[0, 1].item()
 
     def _tune_threshold(self, val_dataset, val_contexts):
         """
@@ -221,7 +254,10 @@ class TransformerEncoderModel(ForecasterModel):
         :return: A dictionary containing the best checkpoint path, best threshold, and best validation accuracy.
         """
         checkpoints = [cp for cp in os.listdir(self.config.output_dir) if "checkpoint-" in cp]
-        best_val_accuracy = 0
+        if len(checkpoints) == 0:
+            raise ValueError("no checkpoints found for threshold tuning")
+        best_val_accuracy = -1
+        best_checkpoint = checkpoints[0]
         val_convo_ids = set()
         utt2convo = {}
         val_labels_dict = {}
@@ -238,7 +274,7 @@ class TransformerEncoderModel(ForecasterModel):
             finetuned_model = AutoModelForSequenceClassification.from_pretrained(
                 full_model_path
             ).to(self.config.device)
-            val_scores = self._predict(val_dataset, model=finetuned_model)
+            val_scores = self._score_dataset(val_dataset, model=finetuned_model)
             # for each CONVERSATION, whether or not it triggers will be effectively determined by what the highest score it ever got was
             highest_convo_scores = {convo_id: -1 for convo_id in val_convo_ids}
             for utt_id in val_scores.index:
@@ -266,7 +302,7 @@ class TransformerEncoderModel(ForecasterModel):
                 self.best_threshold = thresholds[best_acc_idx]
                 self.model = finetuned_model
 
-        eval_forecasts_df = self._predict(val_dataset, threshold=self.best_threshold)
+        eval_forecasts_df = self._score_dataset(val_dataset, threshold=self.best_threshold)
         eval_prediction_file = os.path.join(self.config.output_dir, "val_predictions.csv")
         eval_forecasts_df.to_csv(eval_prediction_file)
 
@@ -291,7 +327,7 @@ class TransformerEncoderModel(ForecasterModel):
         )
         return best_config
 
-    def fit(self, contexts, val_contexts):
+    def fit_belief_estimator(self, contexts, val_contexts=None):
         """
         Fine-tune the TransformerEncoder model, and save the best model according to validation performance.
 
@@ -301,12 +337,10 @@ class TransformerEncoderModel(ForecasterModel):
         held-out validation set.
 
         :param contexts: an iterator over context tuples, provided by the Forecaster framework
-        :param val_contexts: an iterator over context tuples to be used only for validation.
+        :param val_contexts: optional validation contexts (not used by this stage).
         """
-        val_contexts = list(val_contexts)
         train_pairs = self._context_to_bert_data(contexts)
-        val_for_tuning_pairs = self._context_to_bert_data(val_contexts)
-        dataset = DatasetDict({"train": train_pairs, "val_for_tuning": val_for_tuning_pairs})
+        dataset = DatasetDict({"train": train_pairs})
         dataset.set_format("torch")
 
         training_args = TrainingArguments(
@@ -324,8 +358,24 @@ class TransformerEncoderModel(ForecasterModel):
         )
         trainer = Trainer(model=self.model, args=training_args, train_dataset=dataset["train"])
         trainer.train()
-        _ = self._tune_threshold(dataset["val_for_tuning"], val_contexts)
         return
+
+    def fit_decision_policy(self, contexts, val_contexts=None):
+        if val_contexts is None:
+            return super().fit_decision_policy(contexts, val_contexts)
+        val_contexts = list(val_contexts)
+        val_for_tuning_pairs = self._context_to_bert_data(val_contexts)
+        val_for_tuning_pairs.set_format("torch")
+        return self._tune_threshold(val_for_tuning_pairs, val_contexts)
+
+    def fit(self, contexts, val_contexts=None):
+        return super().fit(contexts, val_contexts)
+
+    def _predict(self, context, threshold=None):
+        utt_score = self.score(context)
+        if threshold is not None:
+            return utt_score, int(utt_score > threshold)
+        return utt_score, self.decision_policy.decide(context, self.score)
 
     def transform(self, contexts, forecast_attribute_name, forecast_prob_attribute_name):
         """
@@ -337,14 +387,16 @@ class TransformerEncoderModel(ForecasterModel):
 
         :return: a Pandas DataFrame, with one row for each context, indexed by the ID of that context's current utterance. Contains two columns, one with raw probabilities named according to forecast_prob_attribute_name, and one with discretized (binary) forecasts named according to forecast_attribute_name
         """
-        test_pairs = self._context_to_bert_data(contexts)
-        dataset = DatasetDict({"test": test_pairs})
-        dataset.set_format("torch")
-        forecasts_df = self._predict(
-            dataset["test"],
-            threshold=self.best_threshold,
-            forecast_attribute_name=forecast_attribute_name,
-            forecast_prob_attribute_name=forecast_prob_attribute_name,
+        utt_ids = []
+        preds = []
+        scores = []
+        for context in tqdm(contexts):
+            utt_score, utt_pred = self._predict(context)
+            utt_ids.append(context.current_utterance.id)
+            preds.append(utt_pred)
+            scores.append(utt_score)
+        forecasts_df = pd.DataFrame(
+            {forecast_attribute_name: preds, forecast_prob_attribute_name: scores}, index=utt_ids
         )
 
         prediction_file = os.path.join(self.config.output_dir, "test_predictions.csv")
