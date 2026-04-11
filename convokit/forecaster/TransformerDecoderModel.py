@@ -1,3 +1,4 @@
+from itertools import tee
 import unsloth
 from unsloth import FastLanguageModel, is_bfloat16_supported
 from unsloth.chat_templates import get_chat_template
@@ -5,18 +6,13 @@ import torch
 import torch.nn.functional as F
 from trl import SFTTrainer, SFTConfig
 from datasets import Dataset
+from collections import defaultdict
 
-import json
 import os
 from tqdm import tqdm
 import pandas as pd
-import numpy as np
-from sklearn.metrics import roc_curve
 from .forecasterModel import ForecasterModel
 from .TransformerForecasterConfig import TransformerForecasterConfig
-from convokit.decisionpolicy import ThresholdDecisionPolicy
-import shutil
-
 
 def _get_template_map(model_name_or_path):
     """
@@ -120,6 +116,22 @@ class TransformerDecoderModel(ForecasterModel):
     def best_threshold(self, value):
         if hasattr(self.decision_policy, "threshold"):
             self.decision_policy.threshold = float(value)
+
+    def get_checkpoints(self):
+        checkpoints = [cp for cp in os.listdir(self.config.output_dir) if "checkpoint-" in cp]
+        if len(checkpoints) == 0:
+            return ["zero-shot"]
+        return checkpoints
+
+    def load_checkpoint(self, checkpoint_name):
+        if checkpoint_name == "zero-shot":
+            return
+        full_model_path = os.path.join(self.config.output_dir, checkpoint_name)
+        self.model, _ = FastLanguageModel.from_pretrained(
+            model_name=full_model_path,
+            max_seq_length=self.max_seq_length,
+            load_in_4bit=True,
+        )
 
     def _context_mode(self, context):
         """
@@ -273,9 +285,9 @@ class TransformerDecoderModel(ForecasterModel):
             model=self.model,
             tokenizer=self.tokenizer,
             train_dataset=train_dataset,
+            max_seq_length=self.max_seq_length,
             args=SFTConfig(
                 dataset_text_field="text",
-                max_seq_length=self.max_seq_length,
                 per_device_train_batch_size=self.config.per_device_batch_size,
                 gradient_accumulation_steps=self.config.gradient_accumulation_steps,
                 warmup_steps=10,
@@ -296,114 +308,6 @@ class TransformerDecoderModel(ForecasterModel):
         )
         trainer.train()
         return
-
-    def _tune_threshold(self, val_contexts):
-        """
-        Tune the decision threshold and select the best model checkpoint based on validation accuracy.
-
-        This method evaluates all model checkpoints in the configured output directory using a
-        held-out validation set.
-
-        The selected model, threshold, and associated metadata are stored in:
-        - `self.model`: the best-performing fine-tuned model
-        - `self.best_threshold`: the optimal decision threshold
-        - `dev_config.json`: file containing best checkpoint metadata
-        - `val_predictions.csv`: CSV file with forecast outputs on the validation set
-
-        Additionally, all non-optimal model checkpoints are removed to save disk space, and the
-        tokenizer is saved to the directory of the best checkpoint.
-
-        :param val_dataset: A HuggingFace-compatible dataset containing features for validation.
-        :param val_contexts: An iterable of context tuples corresponding to the validation set.
-                            Used to map utterance IDs to conversation IDs and extract ground-truth labels.
-
-        :return: A dictionary containing the best checkpoint path, best threshold, and best validation accuracy.
-        """
-        checkpoints = [cp for cp in os.listdir(self.config.output_dir) if "checkpoint-" in cp]
-        if checkpoints == []:
-            checkpoints.append("zero-shot")
-        best_val_accuracy = -1
-        best_checkpoint = checkpoints[0]
-        val_convo_ids = set()
-        utt2convo = {}
-        val_labels_dict = {}
-        val_contexts = list(val_contexts)
-        for context in val_contexts:
-            convo_id = context.conversation_id
-            utt_id = context.current_utterance.id
-            label = self.labeler(context.current_utterance.get_conversation())
-            utt2convo[utt_id] = convo_id
-            val_labels_dict[convo_id] = label
-            val_convo_ids.add(convo_id)
-        val_convo_ids = list(val_convo_ids)
-        for cp in checkpoints:
-            if cp != "zero-shot":
-                full_model_path = os.path.join(self.config.output_dir, cp)
-                self.model, _ = FastLanguageModel.from_pretrained(
-                    model_name=full_model_path,
-                    max_seq_length=self.max_seq_length,
-                    load_in_4bit=True,
-                )
-            FastLanguageModel.for_inference(self.model)
-            utt2score = {}
-            for context in tqdm(val_contexts):
-                utt_score = self.score(context)
-                utt_id = context.current_utterance.id
-                utt2score[utt_id] = utt_score
-            # for each CONVERSATION, whether or not it triggers will be effectively determined by what the highest score it ever got was
-            highest_convo_scores = {convo_id: -1 for convo_id in val_convo_ids}
-
-            for utt_id in utt2convo:
-                convo_id = utt2convo[utt_id]
-                utt_score = utt2score[utt_id]
-                if utt_score > highest_convo_scores[convo_id]:
-                    highest_convo_scores[convo_id] = utt_score
-
-            val_labels = np.asarray([int(val_labels_dict[c]) for c in val_convo_ids])
-            val_scores = np.asarray([highest_convo_scores[c] for c in val_convo_ids])
-            # use scikit learn to find candidate threshold cutoffs
-            _, _, thresholds = roc_curve(val_labels, val_scores)
-
-            def acc_with_threshold(y_true, y_score, thresh):
-                y_pred = (y_score > thresh).astype(int)
-                return (y_pred == y_true).mean()
-
-            accs = [acc_with_threshold(val_labels, val_scores, t) for t in thresholds]
-            best_acc_idx = np.argmax(accs)
-
-            print("Accuracy:", cp, accs[best_acc_idx])
-            if accs[best_acc_idx] > best_val_accuracy:
-                best_checkpoint = cp
-                best_val_accuracy = accs[best_acc_idx]
-                self.best_threshold = thresholds[best_acc_idx]
-
-        # Save the best config
-        best_config = {}
-        best_config["best_checkpoint"] = best_checkpoint
-        best_config["best_threshold"] = self.best_threshold
-        best_config["best_val_accuracy"] = best_val_accuracy
-        config_file = os.path.join(self.config.output_dir, "dev_config.json")
-        with open(config_file, "w") as outfile:
-            json_object = json.dumps(best_config, indent=4)
-            outfile.write(json_object)
-        # Load best model
-        best_model_path = os.path.join(self.config.output_dir, best_checkpoint)
-        self.model, _ = FastLanguageModel.from_pretrained(
-            model_name=best_model_path,
-            max_seq_length=self.max_seq_length,
-            load_in_4bit=True,
-        )
-
-        # Clean other checkpoints to save disk space.
-        for root, _, _ in os.walk(self.config.output_dir):
-            if ("checkpoint" in root) and (best_checkpoint not in root):
-                print("Deleting:", root)
-                shutil.rmtree(root)
-        # Save the tokenizer.
-        self.tokenizer.save_pretrained(
-            os.path.join(self.config.output_dir, best_config["best_checkpoint"])
-        )
-        return best_config
 
     def score(self, context) -> float:
         FastLanguageModel.for_inference(self.model)
@@ -450,19 +354,14 @@ class TransformerDecoderModel(ForecasterModel):
         if threshold is not None:
             utt_pred = int(utt_score > threshold)
         else:
-            utt_pred = self.decision_policy.decide(context, self.score)
+            utt_score, utt_pred, _ = self.decision_policy.decide(context, self.score)
         return utt_score, utt_pred
 
-    def fit_decision_policy(self, contexts, val_contexts=None):
-        if (
-            val_contexts is not None
-            and isinstance(self.decision_policy, ThresholdDecisionPolicy)
-        ):
-            return self._tune_threshold(val_contexts)
-        return super().fit_decision_policy(contexts, val_contexts)
-
     def fit(self, contexts, val_contexts=None):
-        return super().fit(contexts, val_contexts)
+        val_contexts_belief_estimator, val_contexts_decision_policy = tee(val_contexts, 2)
+        self.fit_belief_estimator(contexts, val_contexts_belief_estimator)
+        self.fit_decision_policy(contexts, val_contexts_decision_policy, score_fn=self.score)
+        return
 
     def transform(self, contexts, forecast_attribute_name, forecast_prob_attribute_name):
         """
@@ -478,15 +377,36 @@ class TransformerDecoderModel(ForecasterModel):
         utt_ids = []
         preds = []
         scores = []
+        metadatas = defaultdict(list)
+        # for safety/flexibility we can accept either only score and pred or also the metadata
         for context in tqdm(contexts):
-            utt_score, utt_pred = self._predict(context)
+            result = self.decision_policy.decide(context, self.score)
 
+            if len(result) == 2:
+                utt_score, utt_pred = result
+                utt_metadata = {}
+                # no metadata
+            elif len(result) == 3:
+                utt_score, utt_pred, utt_metadata = result
+                for key in utt_metadata.keys():
+                    metadatas[key].append(utt_metadata.get(key, None))
+            else:
+                raise ValueError(
+                    "decision_policy.decide() must return (utt_score, utt_pred) "
+                    "or (utt_score, utt_pred, metadata_dict)"
+                )
             utt_ids.append(context.current_utterance.id)
             preds.append(utt_pred)
             scores.append(utt_score)
-        forecasts_df = pd.DataFrame(
-            {forecast_attribute_name: preds, forecast_prob_attribute_name: scores}, index=utt_ids
-        )
+        cols = {
+            forecast_attribute_name: preds,
+            forecast_prob_attribute_name: scores,
+        }
+        for key, series in metadatas.items():
+            assert len(series) == len(preds), "Metadata series length must match number of predictions"
+            cols[key] = series # each series same length as preds
+        forecasts_df = pd.DataFrame(cols, index=utt_ids)
+
         prediction_file = os.path.join(self.config.output_dir, "test_predictions.csv")
         forecasts_df.to_csv(prediction_file)
         return forecasts_df

@@ -1,8 +1,4 @@
-from itertools import tee
-from typing import Callable, List, Optional
-
-import numpy as np
-from sklearn.metrics import roc_curve
+from typing import Callable, List, Optional, Dict, Any, Tuple
 
 from .decisionPolicy import DecisionPolicy
 
@@ -25,56 +21,63 @@ class _synthetic_utterance:
 
 class DeferralDecisionPolicy(DecisionPolicy):
     """
-    Decision policy that can defer intervention using simulated next utterances.
+    Decision policy that defers intervention by looking ahead at simulated next utterances.
+
+    :param simulator: utterance simulator model (must have a ``transform(contexts)`` method
+        returning a DataFrame indexed by utterance id). if the simulator exposes
+        ``get_num_simulations()``, ``num_simulations`` is capped to that value.
+    :param threshold: probability threshold above which a context is flagged.
+    :param tau: minimum number of simulated branches that must exceed the threshold
+        before an intervention is issued.
+    :param num_simulations: how many simulated branches to use per context (capped to
+        simulator's ``get_num_simulations()`` if available).
+    :param store_simulations: if True, simulated reply strings are cached during decide()
+        and written to corpus utterance metadata by post_transform().
+    :param simulated_reply_attribute_name: metadata field name used when storing simulations
+        on corpus utterances (only relevant when store_simulations=True).
     """
 
     def __init__(
         self,
-        simulator=None,
-        threshold: float = 0.5,
-        num_simulations: int = 3,
-        aggregation: str = "mean",
+        simulator,
+        threshold,
+        tau: int = 5,
+        num_simulations: int = 10,
+        store_simulations: bool = False,
+        simulated_reply_attribute_name: str = "sim_replies",
+        sim_replies_forecast_probs_attribute_name: str = "sim_replies_forecast_probs",
     ):
         super().__init__()
         self.simulator = simulator
         self.threshold = float(threshold)
-        self.num_simulations = int(num_simulations)
-        self.aggregation = aggregation
+        self.tau = int(tau)
+        n = int(num_simulations)
+        if simulator is not None and hasattr(simulator, "get_num_simulations"):
+            n = min(n, int(simulator.get_num_simulations()))
+        self.num_simulations = n
+        self.store_simulations = store_simulations
+        self.simulated_reply_attribute_name = simulated_reply_attribute_name
+        self.sim_replies_forecast_probs_attribute_name = sim_replies_forecast_probs_attribute_name
+        self._sim_cache: dict = {}
+        self._sim_score_cache: dict = {}
 
-    def _aggregate_scores(self, scores: List[float]) -> float:
-        if len(scores) == 0:
-            return 0.0
-        if self.aggregation == "max":
-            return float(np.max(scores))
-        if self.aggregation == "min":
-            return float(np.min(scores))
-        return float(np.mean(scores))
-
-    def get_simulations(self, context, simulator=None, k: Optional[int] = None) -> List[str]:
-        simulator = simulator if simulator is not None else self.simulator
-        if k is None:
-            k = self.num_simulations
-        if simulator is None:
+    def get_simulations(self, context, simulator=None) -> List[str]:
+        sim = simulator if simulator is not None else self.simulator
+        if sim is None or not hasattr(sim, "transform"):
             return []
-        if callable(simulator):
-            sims = simulator(context, k)
-            return list(sims)[:k]
-        if hasattr(simulator, "get_simulations"):
-            sims = simulator.get_simulations(context, k)
-            return list(sims)[:k]
-        if hasattr(simulator, "transform"):
-            sims = simulator.transform(iter([context]))
-            if context.current_utterance.id in sims.index:
-                col_name = sims.columns[0]
-                return list(sims.loc[context.current_utterance.id][col_name])[:k]
-        return []
+        sims = sim.transform(iter([context]))
+        utt_id = context.current_utterance.id
+        if utt_id not in sims.index or sims.shape[1] == 0:
+            return []
+        col_name = sims.columns[0]
+        return list(sims.loc[utt_id][col_name])[: self.num_simulations]
 
     def _build_simulated_context(self, context, simulation_text: str, simulation_idx: int):
         current_utt = context.current_utterance
         synthetic_utt = _synthetic_utterance(
             text=simulation_text,
             utterance_id=f"{current_utt.id}__sim_{simulation_idx}",
-            speaker_id="simulator",
+            speaker_id="",
         )
         new_context_utts = list(context.context) + [synthetic_utt]
         context_cls = context.__class__
@@ -85,60 +88,49 @@ class DeferralDecisionPolicy(DecisionPolicy):
             conversation_id=context.conversation_id,
         )
 
-    def _decision_score(self, context, score_fn: Callable) -> float:
+    def _decision_score(self, context, score_fn: Callable):
         current_score = float(score_fn(context))
         simulations = self.get_simulations(context)
-        if len(simulations) == 0:
-            return current_score
         simulation_scores = []
         for idx, sim_text in enumerate(simulations):
             sim_context = self._build_simulated_context(context, sim_text, idx)
             simulation_scores.append(float(score_fn(sim_context)))
-        return self._aggregate_scores([current_score] + simulation_scores)
+        if self.store_simulations and simulations:
+            utt_id = context.current_utterance.id
+            self._sim_cache[utt_id] = simulations
+            self._sim_score_cache[utt_id] = simulation_scores
+        return current_score, simulations, simulation_scores
 
-    def decide(self, context, score_fn: Callable) -> int:
-        decision_score = self._decision_score(context, score_fn)
-        return int(decision_score > self.threshold)
+    def decide(self, context, score_fn: Callable) -> Tuple[float, int, Optional[Dict[str, Any]]]:
+        decision_score, simulations, simulation_scores = self._decision_score(context, score_fn)
+        num_simulations_above_threshold = sum(1 for score in simulation_scores if score > self.threshold)
+
+        # we want to return an awry prediction if we have 
+        return (decision_score,
+        1 if decision_score > self.threshold and num_simulations_above_threshold > 5 else 0,
+        {
+            self.simulated_reply_attribute_name: simulations,
+            self.sim_replies_forecast_probs_attribute_name: simulation_scores,
+        }
+        )
 
     def fit(self, contexts, val_contexts=None, score_fn: Callable = None):
-        if self.simulator is not None and hasattr(self.simulator, "fit"):
-            if val_contexts is None:
-                sim_contexts = contexts
-                sim_val_contexts = None
-            else:
-                sim_contexts, contexts = tee(contexts, 2)
-                sim_val_contexts, val_contexts = tee(val_contexts, 2)
-            self.simulator.fit(sim_contexts, sim_val_contexts)
-
         if val_contexts is None or score_fn is None or self.labeler is None:
-            return {"threshold": self.threshold}
+            print("either no validation contexts/score function/labeler were provided, returning current threshold")
+            return {"best_threshold": self.threshold}
+
         val_contexts = list(val_contexts)
         if len(val_contexts) == 0:
-            return {"threshold": self.threshold}
+            print("no validation contexts were provided, returning current threshold")
+            return {"best_threshold": self.threshold}
 
-        highest_convo_scores = {}
-        convo_labels = {}
-        for context in val_contexts:
-            convo_id = context.conversation_id
-            score = self._decision_score(context, score_fn)
-            label = int(self.labeler(context.current_utterance.get_conversation()))
-            if convo_id not in highest_convo_scores:
-                highest_convo_scores[convo_id] = score
-            else:
-                highest_convo_scores[convo_id] = max(highest_convo_scores[convo_id], score)
-            convo_labels[convo_id] = label
+        fit_result = self._fit_with_model_checkpoint_selection(val_contexts, score_fn=score_fn)
+        if isinstance(fit_result, dict):
+            if "best_threshold" in fit_result:
+                self.threshold = float(fit_result["best_threshold"])
+            return fit_result
 
-        convo_ids = list(highest_convo_scores.keys())
-        y_true = np.asarray([convo_labels[c] for c in convo_ids])
-        y_score = np.asarray([highest_convo_scores[c] for c in convo_ids])
-        try:
-            _, _, thresholds = roc_curve(y_true, y_score)
-        except ValueError:
-            return {"threshold": self.threshold}
-        if len(thresholds) == 0:
-            return {"threshold": self.threshold}
-
-        accs = [((y_score > t).astype(int) == y_true).mean() for t in thresholds]
-        best_idx = int(np.argmax(accs))
-        self.threshold = float(thresholds[best_idx])
-        return {"threshold": self.threshold, "best_val_accuracy": float(accs[best_idx])}
+        fit_result = self._fit_threshold_for_loaded_model(val_contexts, score_fn=score_fn)
+        if "best_threshold" in fit_result:
+            self.threshold = float(fit_result["best_threshold"])
+        return fit_result

@@ -2,6 +2,10 @@ from abc import ABC, abstractmethod
 from itertools import tee
 from typing import Callable
 
+import json
+import os
+import shutil
+
 from convokit.decisionpolicy import ThresholdDecisionPolicy
 
 
@@ -36,6 +40,7 @@ class ForecasterModel(ABC):
         if self._decision_policy is not None:
             self._decision_policy.labeler = self._labeler
 
+    @abstractmethod
     def fit(self, contexts, val_contexts=None):
         """
         Train this conversational forecasting model on the given data by fitting
@@ -44,14 +49,7 @@ class ForecasterModel(ABC):
         :param contexts: an iterator over context tuples
         :param val_contexts: an optional second iterator over context tuples to be used as a separate held-out validation set. Concrete ForecasterModel implementations may choose to ignore this, or conversely even enforce its presence.
         """
-        belief_contexts, policy_contexts = tee(contexts, 2)
-        if val_contexts is None:
-            belief_val_contexts = None
-            policy_val_contexts = None
-        else:
-            belief_val_contexts, policy_val_contexts = tee(val_contexts, 2)
-        self.fit_belief_estimator(belief_contexts, belief_val_contexts)
-        self.fit_decision_policy(policy_contexts, policy_val_contexts)
+        pass
 
     @abstractmethod
     def fit_belief_estimator(self, contexts, val_contexts=None):
@@ -60,15 +58,82 @@ class ForecasterModel(ABC):
         """
         pass
 
-    def fit_decision_policy(self, contexts, val_contexts=None):
+    def fit_decision_policy(self, contexts, val_contexts=None, score_fn: Callable = None):
         """
         Fit only the decision policy component.
         """
         if self.decision_policy is not None:
-            return self.decision_policy.fit(
-                contexts=contexts, val_contexts=val_contexts, score_fn=self.score
+            if score_fn is None:
+                score_fn = self.score
+            fit_result = self.decision_policy.fit(
+                contexts=contexts, val_contexts=val_contexts, score_fn=score_fn
             )
+            self._json_dump_fit_result(fit_result)
+            return fit_result
         return None
+
+    def _json_dump_fit_result(self, fit_result):
+        if not isinstance(fit_result, dict):
+            return
+
+        output_dir = getattr(getattr(self, "config", None), "output_dir", None)
+        if output_dir is None:
+            return
+
+        config_file = os.path.join(output_dir, "dev_config.json")
+        existing_config = {}
+        if os.path.exists(config_file):
+            try:
+                with open(config_file, "r") as infile:
+                    existing_config = json.load(infile)
+            except (json.JSONDecodeError, OSError):
+                existing_config = {}
+
+        if "best_checkpoint" in fit_result:
+            existing_config["best_checkpoint"] = fit_result["best_checkpoint"]
+        if "best_threshold" in fit_result:
+            existing_config["best_threshold"] = float(fit_result["best_threshold"])
+        if "best_val_accuracy" in fit_result:
+            existing_config["best_val_accuracy"] = float(fit_result["best_val_accuracy"])
+
+        with open(config_file, "w") as outfile:
+            json.dump(existing_config, outfile, indent=4)
+
+    def get_checkpoints(self):
+        return []
+
+    def load_checkpoint(self, checkpoint_name):
+        raise NotImplementedError("checkpoint loading is not implemented for this model")
+
+    def finalize_best_checkpoint_selection(
+        self, best_checkpoint, best_config, val_contexts=None, score_fn: Callable = None
+    ):
+        if best_checkpoint is None:
+            return
+        self._cleanup_checkpoints(best_checkpoint)
+        self._save_tokenizer_checkpoint(best_checkpoint)
+
+    def _cleanup_checkpoints(self, best_checkpoint):
+        output_dir = getattr(getattr(self, "config", None), "output_dir", None)
+        if output_dir is None or best_checkpoint is None:
+            return
+
+        for root, _, _ in os.walk(output_dir):
+            if ("checkpoint" in root) and (best_checkpoint not in root):
+                print(f"deleting: {root}")
+                shutil.rmtree(root)
+
+    def _save_tokenizer_checkpoint(self, best_checkpoint):
+        tokenizer = getattr(self, "tokenizer", None)
+        output_dir = getattr(getattr(self, "config", None), "output_dir", None)
+        if (
+            tokenizer is None
+            or output_dir is None
+            or best_checkpoint is None
+            or not hasattr(tokenizer, "save_pretrained")
+        ):
+            return
+        tokenizer.save_pretrained(os.path.join(output_dir, best_checkpoint))
 
     @abstractmethod
     def score(self, context) -> float:
@@ -80,9 +145,10 @@ class ForecasterModel(ABC):
     def _predict(self, context):
         """
         Return both belief score and policy action for a context.
+
+        This method is deprecated in favor of using the self.decision_policy.decide method.
         """
-        utt_score = self.score(context)
-        utt_pred = self.decision_policy.decide(context, self.score)
+        utt_score, utt_pred = self.decision_policy.decide(context, self.score)
         return utt_score, utt_pred
 
     @abstractmethod

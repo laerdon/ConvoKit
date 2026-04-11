@@ -11,14 +11,9 @@ from transformers import (
 
 import os
 import pandas as pd
-import numpy as np
-import json
 from tqdm import tqdm
-from sklearn.metrics import roc_curve
 from .forecasterModel import ForecasterModel
 from .TransformerForecasterConfig import TransformerForecasterConfig
-from convokit.decisionpolicy import ThresholdDecisionPolicy
-import shutil
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -73,6 +68,29 @@ class TransformerEncoderModel(ForecasterModel):
     def best_threshold(self, value):
         if hasattr(self.decision_policy, "threshold"):
             self.decision_policy.threshold = float(value)
+
+    def get_checkpoints(self):
+        return [cp for cp in os.listdir(self.config.output_dir) if "checkpoint-" in cp]
+
+    def load_checkpoint(self, checkpoint_name):
+        full_model_path = os.path.join(self.config.output_dir, checkpoint_name)
+        self.model = AutoModelForSequenceClassification.from_pretrained(full_model_path).to(
+            self.config.device
+        )
+
+    def finalize_best_checkpoint_selection(
+        self, best_checkpoint, best_config, val_contexts=None, score_fn=None
+    ):
+        super().finalize_best_checkpoint_selection(
+            best_checkpoint, best_config, val_contexts=val_contexts, score_fn=score_fn
+        )
+        if val_contexts is None or self.best_threshold is None:
+            return
+        val_dataset = self._context_to_bert_data(val_contexts)
+        val_dataset.set_format("torch")
+        eval_forecasts_df = self._score_dataset(val_dataset, threshold=self.best_threshold)
+        eval_prediction_file = os.path.join(self.config.output_dir, "val_predictions.csv")
+        eval_forecasts_df.to_csv(eval_prediction_file)
 
     def _context_mode(self, context):
         """
@@ -231,102 +249,6 @@ class TransformerEncoderModel(ForecasterModel):
         probs = F.softmax(outputs.logits, dim=-1)
         return probs[0, 1].item()
 
-    def _tune_threshold(self, val_dataset, val_contexts):
-        """
-        Tune the decision threshold and select the best model checkpoint based on validation accuracy.
-
-        This method evaluates all model checkpoints in the configured output directory using a
-        held-out validation set.
-
-        The selected model, threshold, and associated metadata are stored in:
-        - `self.model`: the best-performing fine-tuned model
-        - `self.best_threshold`: the optimal decision threshold
-        - `dev_config.json`: file containing best checkpoint metadata
-        - `val_predictions.csv`: CSV file with forecast outputs on the validation set
-
-        Additionally, all non-optimal model checkpoints are removed to save disk space, and the
-        tokenizer is saved to the directory of the best checkpoint.
-
-        :param val_dataset: A HuggingFace-compatible dataset containing features for validation.
-        :param val_contexts: An iterable of context tuples corresponding to the validation set.
-                            Used to map utterance IDs to conversation IDs and extract ground-truth labels.
-
-        :return: A dictionary containing the best checkpoint path, best threshold, and best validation accuracy.
-        """
-        checkpoints = [cp for cp in os.listdir(self.config.output_dir) if "checkpoint-" in cp]
-        if len(checkpoints) == 0:
-            raise ValueError("no checkpoints found for threshold tuning")
-        best_val_accuracy = -1
-        best_checkpoint = checkpoints[0]
-        val_convo_ids = set()
-        utt2convo = {}
-        val_labels_dict = {}
-        for context in val_contexts:
-            convo_id = context.conversation_id
-            utt_id = context.current_utterance.id
-            label = self.labeler(context.current_utterance.get_conversation())
-            utt2convo[utt_id] = convo_id
-            val_labels_dict[convo_id] = label
-            val_convo_ids.add(convo_id)
-        val_convo_ids = list(val_convo_ids)
-        for cp in checkpoints:
-            full_model_path = os.path.join(self.config.output_dir, cp)
-            finetuned_model = AutoModelForSequenceClassification.from_pretrained(
-                full_model_path
-            ).to(self.config.device)
-            val_scores = self._score_dataset(val_dataset, model=finetuned_model)
-            # for each CONVERSATION, whether or not it triggers will be effectively determined by what the highest score it ever got was
-            highest_convo_scores = {convo_id: -1 for convo_id in val_convo_ids}
-            for utt_id in val_scores.index:
-                convo_id = utt2convo[utt_id]
-                utt_score = val_scores.loc[utt_id].forecast_prob
-                if utt_score > highest_convo_scores[convo_id]:
-                    highest_convo_scores[convo_id] = utt_score
-
-            val_labels = np.asarray([int(val_labels_dict[c]) for c in val_convo_ids])
-            val_scores = np.asarray([highest_convo_scores[c] for c in val_convo_ids])
-            # use scikit learn to find candidate threshold cutoffs
-            _, _, thresholds = roc_curve(val_labels, val_scores)
-
-            def acc_with_threshold(y_true, y_score, thresh):
-                y_pred = (y_score > thresh).astype(int)
-                return (y_pred == y_true).mean()
-
-            accs = [acc_with_threshold(val_labels, val_scores, t) for t in thresholds]
-            best_acc_idx = np.argmax(accs)
-
-            print("Accuracy:", cp, accs[best_acc_idx])
-            if accs[best_acc_idx] > best_val_accuracy:
-                best_checkpoint = cp
-                best_val_accuracy = accs[best_acc_idx]
-                self.best_threshold = thresholds[best_acc_idx]
-                self.model = finetuned_model
-
-        eval_forecasts_df = self._score_dataset(val_dataset, threshold=self.best_threshold)
-        eval_prediction_file = os.path.join(self.config.output_dir, "val_predictions.csv")
-        eval_forecasts_df.to_csv(eval_prediction_file)
-
-        # Save the best config
-        best_config = {}
-        best_config["best_checkpoint"] = best_checkpoint
-        best_config["best_threshold"] = self.best_threshold
-        best_config["best_val_accuracy"] = best_val_accuracy
-        config_file = os.path.join(self.config.output_dir, "dev_config.json")
-        with open(config_file, "w") as outfile:
-            json_object = json.dumps(best_config, indent=4)
-            outfile.write(json_object)
-
-        # Clean other checkpoints to save disk space.
-        for root, _, _ in os.walk(self.config.output_dir):
-            if ("checkpoint" in root) and (best_checkpoint not in root):
-                print("Deleting:", root)
-                shutil.rmtree(root)
-        # Save the tokenizer.
-        self.tokenizer.save_pretrained(
-            os.path.join(self.config.output_dir, best_config["best_checkpoint"])
-        )
-        return best_config
-
     def fit_belief_estimator(self, contexts, val_contexts=None):
         """
         Fine-tune the TransformerEncoder model, and save the best model according to validation performance.
@@ -359,14 +281,6 @@ class TransformerEncoderModel(ForecasterModel):
         trainer = Trainer(model=self.model, args=training_args, train_dataset=dataset["train"])
         trainer.train()
         return
-
-    def fit_decision_policy(self, contexts, val_contexts=None):
-        if val_contexts is None:
-            return super().fit_decision_policy(contexts, val_contexts)
-        val_contexts = list(val_contexts)
-        val_for_tuning_pairs = self._context_to_bert_data(val_contexts)
-        val_for_tuning_pairs.set_format("torch")
-        return self._tune_threshold(val_for_tuning_pairs, val_contexts)
 
     def fit(self, contexts, val_contexts=None):
         return super().fit(contexts, val_contexts)

@@ -121,6 +121,20 @@ class Forecaster(Transformer):
         self.forecaster_model.fit(contexts, val_contexts)
 
         return self
+    
+    def fit_decision_policy(self, corpus, context_selector, val_context_selector):
+        contexts = self._create_context_iterator(corpus, context_selector, include_future_context=True)
+        val_contexts = None
+        if val_context_selector is not None:
+            val_contexts = self._create_context_iterator(corpus, val_context_selector, include_future_context=True)
+        return self.forecaster_model.fit_decision_policy(contexts, val_contexts)
+    
+    def fit_belief_estimator(self, corpus, context_selector, val_context_selector):
+        contexts = self._create_context_iterator(corpus, context_selector, include_future_context=True)
+        val_contexts = None
+        if val_context_selector is not None:
+            val_contexts = self._create_context_iterator(corpus, val_context_selector, include_future_context=True)
+        return self.forecaster_model.fit_belief_estimator(contexts, val_contexts)
 
     def transform(
         self,
@@ -142,19 +156,16 @@ class Forecaster(Transformer):
             contexts, self.forecast_attribute_name, self.forecast_prob_attribute_name
         )
 
+        # generalize addition of metadata columns
+        meta_columns = list(forecast_df.columns)
         for utt in corpus.iter_utterances():
             if utt.id in forecast_df.index:
-                utt.add_meta(
-                    self.forecast_attribute_name,
-                    forecast_df.loc[utt.id][self.forecast_attribute_name],
-                )
-                utt.add_meta(
-                    self.forecast_prob_attribute_name,
-                    forecast_df.loc[utt.id][self.forecast_prob_attribute_name],
-                )
+                row = forecast_df.loc[utt.id]
+                for col in meta_columns:
+                    utt.add_meta(col, row[col])
             else:
-                utt.add_meta(self.forecast_attribute_name, None)
-                utt.add_meta(self.forecast_prob_attribute_name, None)
+                for col in meta_columns:
+                    utt.add_meta(col, None)
 
         return corpus
 
