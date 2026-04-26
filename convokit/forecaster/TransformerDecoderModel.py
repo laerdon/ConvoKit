@@ -1,4 +1,4 @@
-from itertools import tee
+from itertools import tee, islice
 import unsloth
 from unsloth import FastLanguageModel, is_bfloat16_supported
 from unsloth.chat_templates import get_chat_template
@@ -249,8 +249,7 @@ class TransformerDecoderModel(ForecasterModel):
 
         This method applies Low-Rank Adaptation (LoRA) to the decoder model, converts the
         training contexts into text-based input for LLM fine-tuning, and trains the model
-        using HuggingFace's `SFTTrainer`. After training, it tunes a decision threshold on
-        a held-out validation set to optimize binary forecast classification.
+        using HuggingFace's `SFTTrainer`.
 
         :param contexts: an iterator over context tuples, provided by the Forecaster framework
         :param val_contexts: an iterator over context tuples to be used only for validation.
@@ -354,7 +353,16 @@ class TransformerDecoderModel(ForecasterModel):
         if threshold is not None:
             utt_pred = int(utt_score > threshold)
         else:
-            utt_score, utt_pred, _ = self.decision_policy.decide(context, self.score)
+            result = self.decision_policy.decide(context, self.score)
+            if len(result) == 2:
+                utt_score, utt_pred = result
+            elif len(result) == 3:
+                utt_score, utt_pred, _ = result
+            else:
+                raise ValueError(
+                    "decision_policy.decide() must return (utt_score, utt_pred) "
+                    "or (utt_score, utt_pred, metadata_dict)"
+                )
         return utt_score, utt_pred
 
     def fit(self, contexts, val_contexts=None):
@@ -363,13 +371,14 @@ class TransformerDecoderModel(ForecasterModel):
         self.fit_decision_policy(contexts, val_contexts_decision_policy, score_fn=self.score)
         return
 
-    def transform(self, contexts, forecast_attribute_name, forecast_prob_attribute_name):
+    def transform(self, contexts, forecast_attribute_name, forecast_prob_attribute_name, verbose=False):
         """
         Generate forecasts using the fine-tuned TransformerDecoder model on the provided contexts, and save the predictions to the output directory specified in the configuration.
 
         :param contexts: context tuples from the Forecaster framework
         :param forecast_attribute_name: Forecaster will use this to look up the table column containing your model's discretized predictions (see output specification below)
         :param forecast_prob_attribute_name: Forecaster will use this to look up the table column containing your model's raw forecast probabilities (see output specification below)
+        :param verbose: if True, print verbose transform logging during the transformation
 
         :return: a Pandas DataFrame, with one row for each context, indexed by the ID of that context's current utterance. Contains two columns, one with raw probabilities named according to forecast_prob_attribute_name, and one with discretized (binary) forecasts named according to forecast_attribute_name
         """
@@ -378,8 +387,45 @@ class TransformerDecoderModel(ForecasterModel):
         preds = []
         scores = []
         metadatas = defaultdict(list)
+        # TODO(metrics): temporary running metric logging during transform; remove before merge.
+        report_every_n = 250
+        prediction_file = os.path.join(self.config.output_dir, "predictions.csv")
+        if os.path.exists(prediction_file):
+            os.remove(prediction_file)
+        next_flush_start = 0
+        csv_header_written = False
+        convo_forecasts = {}
+        convo_labels = {}
+
+        def _compute_conversation_metrics():
+            common_convo_ids = [cid for cid in convo_forecasts if cid in convo_labels]
+            if len(common_convo_ids) == 0:
+                return None
+            tp = 0
+            fp = 0
+            tn = 0
+            fn = 0
+            for convo_id in common_convo_ids:
+                pred = int(convo_forecasts[convo_id] > 0)
+                label = int(convo_labels[convo_id])
+                if label == 1 and pred == 1:
+                    tp += 1
+                elif label == 0 and pred == 1:
+                    fp += 1
+                elif label == 0 and pred == 0:
+                    tn += 1
+                elif label == 1 and pred == 0:
+                    fn += 1
+            n = len(common_convo_ids)
+            acc = (tp + tn) / n if n > 0 else 0.0
+            p = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+            r = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            fpr = fp / (fp + tn) if (fp + tn) > 0 else 0.0
+            f1 = (2 * p * r / (p + r)) if (p + r) > 0 else 0.0
+            return {"n": n, "acc": acc, "p": p, "r": r, "fpr": fpr, "f1": f1}
         # for safety/flexibility we can accept either only score and pred or also the metadata
-        for context in tqdm(contexts):
+        progress = tqdm(contexts)
+        for idx, context in enumerate(progress, start=1):
             result = self.decision_policy.decide(context, self.score)
 
             if len(result) == 2:
@@ -388,8 +434,10 @@ class TransformerDecoderModel(ForecasterModel):
                 # no metadata
             elif len(result) == 3:
                 utt_score, utt_pred, utt_metadata = result
-                for key in utt_metadata.keys():
-                    metadatas[key].append(utt_metadata.get(key, None))
+                # coerce None metadata to {} so policies that return (score, pred, None)
+                # don't crash downstream utt_metadata.items() / .get() calls.
+                if utt_metadata is None:
+                    utt_metadata = {}
             else:
                 raise ValueError(
                     "decision_policy.decide() must return (utt_score, utt_pred) "
@@ -398,15 +446,91 @@ class TransformerDecoderModel(ForecasterModel):
             utt_ids.append(context.current_utterance.id)
             preds.append(utt_pred)
             scores.append(utt_score)
+            current_idx = len(preds) - 1
+            existing_metadata_keys = list(metadatas.keys())
+            for key in existing_metadata_keys:
+                metadatas[key].append(utt_metadata.get(key, None))
+            for key, value in utt_metadata.items():
+                if key not in metadatas:
+                    metadatas[key] = [None] * current_idx
+                    metadatas[key].append(value)
+
+            convo_id = getattr(context, "conversation_id", None)
+            try:
+                convo = context.current_utterance.get_conversation()
+                if convo_id is None and convo is not None:
+                    convo_id = convo.id
+                if convo_id is not None:
+                    if convo_id in convo_forecasts:
+                        convo_forecasts[convo_id] = max(convo_forecasts[convo_id], int(utt_pred))
+                    else:
+                        convo_forecasts[convo_id] = int(utt_pred)
+                    if convo_id not in convo_labels:
+                        convo_labels[convo_id] = int(self.labeler(convo))
+            except Exception:
+                pass
+
+            if idx % report_every_n == 0:
+                batch_cols = {
+                    forecast_attribute_name: preds[next_flush_start:idx],
+                    forecast_prob_attribute_name: scores[next_flush_start:idx],
+                }
+                for key, series in metadatas.items():
+                    batch_cols[key] = series[next_flush_start:idx]
+                batch_df = pd.DataFrame(batch_cols, index=utt_ids[next_flush_start:idx])
+                batch_df.to_csv(
+                    prediction_file,
+                    mode="a" if csv_header_written else "w",
+                    header=not csv_header_written,
+                )
+                csv_header_written = True
+                next_flush_start = idx
+
+                running_metrics = _compute_conversation_metrics()
+                if verbose:
+                    if running_metrics is not None:
+                        tqdm.write(
+                            f"[info] transform metrics running: "
+                            f"processed_contexts={idx}, conversations={running_metrics['n']}, "
+                            f"acc={running_metrics['acc']:.4f}, p={running_metrics['p']:.4f}, "
+                            f"r={running_metrics['r']:.4f}, fpr={running_metrics['fpr']:.4f}, "
+                            f"f1={running_metrics['f1']:.4f}"
+                        )
+                    else:
+                        tqdm.write(
+                            f"[info] transform metrics running: "
+                            f"processed_contexts={idx}, conversations=0"
+                        )
+        total_processed = len(preds)
+        if total_processed > next_flush_start:
+            batch_cols = {
+                forecast_attribute_name: preds[next_flush_start:total_processed],
+                forecast_prob_attribute_name: scores[next_flush_start:total_processed],
+            }
+            for key, series in metadatas.items():
+                batch_cols[key] = series[next_flush_start:total_processed]
+            batch_df = pd.DataFrame(batch_cols, index=utt_ids[next_flush_start:total_processed])
+            batch_df.to_csv(
+                prediction_file,
+                mode="a" if csv_header_written else "w",
+                header=not csv_header_written,
+            )
+            csv_header_written = True
         cols = {
             forecast_attribute_name: preds,
             forecast_prob_attribute_name: scores,
         }
+        final_metrics = _compute_conversation_metrics()
+        if final_metrics is not None:
+            tqdm.write(
+                f"[info] final transform metrics: "
+                f"processed_contexts={len(preds)}, conversations={final_metrics['n']}, "
+                f"acc={final_metrics['acc']:.4f}, p={final_metrics['p']:.4f}, "
+                f"r={final_metrics['r']:.4f}, fpr={final_metrics['fpr']:.4f}, "
+                f"f1={final_metrics['f1']:.4f}"
+            )
         for key, series in metadatas.items():
             assert len(series) == len(preds), "Metadata series length must match number of predictions"
             cols[key] = series # each series same length as preds
         forecasts_df = pd.DataFrame(cols, index=utt_ids)
-
-        prediction_file = os.path.join(self.config.output_dir, "test_predictions.csv")
-        forecasts_df.to_csv(prediction_file)
         return forecasts_df

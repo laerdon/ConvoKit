@@ -344,6 +344,7 @@ class CRAFTModel(ForecasterModel):
         # initialize the CRAFT model with whatever weights we currently have saved
         encoder, context_encoder, predictor = self._get_inference_components()
 
+        base_columns = {"id", forecast_attribute_name, forecast_prob_attribute_name}
         output_df = {"id": [], forecast_attribute_name: [], forecast_prob_attribute_name: []}
         batch_iterator = batchIterator(
             self._voc, test_pairs, self._config["batch_size"], shuffle=False
@@ -393,10 +394,20 @@ class CRAFTModel(ForecasterModel):
                         return score
                     return self.score(scored_context)
 
-                pred = self.decision_policy.decide(context, score_fn)
+                utt_score, pred, utt_metadata = self._parse_decision_result(
+                    self.decision_policy.decide(context, score_fn)
+                )
+                current_idx = len(output_df["id"])
                 output_df["id"].append(utt_id)
                 output_df[forecast_attribute_name].append(int(pred))
-                output_df[forecast_prob_attribute_name].append(score)
+                output_df[forecast_prob_attribute_name].append(utt_score)
+                existing_metadata_keys = [key for key in output_df if key not in base_columns]
+                for key in existing_metadata_keys:
+                    output_df[key].append(utt_metadata.get(key, None))
+                for key, value in utt_metadata.items():
+                    if key not in output_df:
+                        output_df[key] = [None] * current_idx
+                        output_df[key].append(value)
             print(
                 "Iteration: {}; Percent complete: {:.1f}%".format(
                     iteration, iteration / n_iters * 100

@@ -11,8 +11,17 @@ class DecisionPolicy(ABC):
     Abstract interface for converting a conversational context into an action.
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        forecast_prob_attribute_name: str = "forecast_prob",
+        reuse_cached_forecast_probs: bool = True,
+    ):
         self._labeler = None
+        # name of the utterance-meta field that may already hold a forecast prob
+        # from a prior Forecaster.transform() pass. kept in sync with the owning
+        # ForecasterModel / Forecaster when they are wired up.
+        self.forecast_prob_attribute_name = forecast_prob_attribute_name
+        self.reuse_cached_forecast_probs = bool(reuse_cached_forecast_probs)
 
     @property
     def labeler(self):
@@ -21,6 +30,18 @@ class DecisionPolicy(ABC):
     @labeler.setter
     def labeler(self, value: Callable):
         self._labeler = value
+
+    def _score(self, context, score_fn: Callable) -> float:
+        # prefer a previously written forecast prob on the current utterance meta
+        # so policies don't re-invoke the belief estimator on utterances the
+        # forecaster has already transformed. synthetic / simulated utterances
+        # carry an empty meta and always fall through to score_fn.
+        if self.reuse_cached_forecast_probs:
+            meta = getattr(getattr(context, "current_utterance", None), "meta", None) or {}
+            cached = meta.get(self.forecast_prob_attribute_name)
+            if cached is not None:
+                return float(cached)
+        return float(score_fn(context))
 
     def _fit_with_model_checkpoint_selection(self, val_contexts, score_fn: Callable = None):
         if score_fn is None:
@@ -43,6 +64,11 @@ class DecisionPolicy(ABC):
         best_config = None
         best_checkpoint = None
         best_val_accuracy = -1.0
+        # while sweeping checkpoints, any cached forecast_prob on utterance meta
+        # reflects whichever checkpoint's transform() ran last, not the one we
+        # are currently evaluating. force a fresh score_fn call for each sweep.
+        prior_reuse_flag = self.reuse_cached_forecast_probs
+        self.reuse_cached_forecast_probs = False
         for checkpoint_name in checkpoints:
             load_checkpoint(checkpoint_name)
             fit_result = self._fit_threshold_for_loaded_model(val_contexts, score_fn=score_fn)
@@ -55,6 +81,7 @@ class DecisionPolicy(ABC):
                     "best_threshold": float(fit_result["best_threshold"]),
                     "best_val_accuracy": float(fit_result["best_val_accuracy"]),
                 }
+        self.reuse_cached_forecast_probs = prior_reuse_flag
 
         if best_config is None:
             return None
@@ -95,7 +122,7 @@ class DecisionPolicy(ABC):
         convo_labels = {}
         for context in tqdm(val_contexts):
             convo_id = context.conversation_id
-            score = float(score_fn(context))
+            score = self._score(context, score_fn)
             label = int(self.labeler(context.current_utterance.get_conversation()))
             if convo_id not in highest_convo_scores:
                 highest_convo_scores[convo_id] = score

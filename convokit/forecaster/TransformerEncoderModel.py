@@ -14,6 +14,7 @@ import pandas as pd
 from tqdm import tqdm
 from .forecasterModel import ForecasterModel
 from .TransformerForecasterConfig import TransformerForecasterConfig
+from itertools import tee
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -283,13 +284,28 @@ class TransformerEncoderModel(ForecasterModel):
         return
 
     def fit(self, contexts, val_contexts=None):
-        return super().fit(contexts, val_contexts)
+        val_contexts_belief_estimator, val_contexts_decision_policy = tee(val_contexts, 2)
+        self.fit_belief_estimator(contexts, val_contexts_belief_estimator)
+        self.fit_decision_policy(contexts, val_contexts_decision_policy, score_fn=self.score)
+        return
 
     def _predict(self, context, threshold=None):
         utt_score = self.score(context)
+        # keep threshold override for backward compatibility.
         if threshold is not None:
-            return utt_score, int(utt_score > threshold)
-        return utt_score, self.decision_policy.decide(context, self.score)
+            utt_pred = int(utt_score > threshold)
+        else:
+            result = self.decision_policy.decide(context, self.score)
+            if len(result) == 2:
+                utt_score, utt_pred = result
+            elif len(result) == 3:
+                utt_score, utt_pred, _ = result
+            else:
+                raise ValueError(
+                    "decision_policy.decide() must return (utt_score, utt_pred) "
+                    "or (utt_score, utt_pred, metadata_dict)"
+                )
+        return utt_score, utt_pred
 
     def transform(self, contexts, forecast_attribute_name, forecast_prob_attribute_name):
         """

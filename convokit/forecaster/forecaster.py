@@ -50,6 +50,9 @@ class Forecaster(Transformer):
 
         # also give the underlying ForecasterModel access to the labeler function
         self.forecaster_model.labeler = self.labeler
+        # keep the decision policy's forecast_prob cache key aligned with the
+        # meta field that Forecaster.transform() writes to.
+        self.forecaster_model.forecast_prob_attribute_name = self.forecast_prob_attribute_name
 
     def _create_context_iterator(
         self,
@@ -140,6 +143,7 @@ class Forecaster(Transformer):
         self,
         corpus: Corpus,
         context_selector: Callable[[ContextTuple], bool] = lambda context: True,
+        **kwargs,
     ) -> Corpus:
         """
         Wrapper method for applying the underlying conversational forecasting model to make forecasts over the Conversations in a given Corpus.
@@ -153,7 +157,7 @@ class Forecaster(Transformer):
         """
         contexts = self._create_context_iterator(corpus, context_selector)
         forecast_df = self.forecaster_model.transform(
-            contexts, self.forecast_attribute_name, self.forecast_prob_attribute_name
+            contexts, self.forecast_attribute_name, self.forecast_prob_attribute_name, **kwargs,
         )
 
         # generalize addition of metadata columns

@@ -18,6 +18,7 @@ class ForecasterModel(ABC):
 
     def __init__(self, decision_policy=None, **kwargs):
         self._labeler = None
+        self._forecast_prob_attribute_name = "forecast_prob"
         self._decision_policy = decision_policy or ThresholdDecisionPolicy()
 
     @property
@@ -31,6 +32,18 @@ class ForecasterModel(ABC):
             self._decision_policy.labeler = value
 
     @property
+    def forecast_prob_attribute_name(self) -> str:
+        return self._forecast_prob_attribute_name
+
+    @forecast_prob_attribute_name.setter
+    def forecast_prob_attribute_name(self, value: str):
+        # keeps the decision policy's cache key aligned with the forecaster's
+        # meta field so policies can reuse previously written forecast probs.
+        self._forecast_prob_attribute_name = value
+        if self._decision_policy is not None:
+            self._decision_policy.forecast_prob_attribute_name = value
+
+    @property
     def decision_policy(self):
         return self._decision_policy
 
@@ -39,6 +52,9 @@ class ForecasterModel(ABC):
         self._decision_policy = value
         if self._decision_policy is not None:
             self._decision_policy.labeler = self._labeler
+            self._decision_policy.forecast_prob_attribute_name = (
+                self._forecast_prob_attribute_name
+            )
 
     @abstractmethod
     def fit(self, contexts, val_contexts=None):
@@ -148,8 +164,25 @@ class ForecasterModel(ABC):
 
         This method is deprecated in favor of using the self.decision_policy.decide method.
         """
-        utt_score, utt_pred = self.decision_policy.decide(context, self.score)
+        utt_score, utt_pred, _ = self._parse_decision_result(
+            self.decision_policy.decide(context, self.score)
+        )
         return utt_score, utt_pred
+
+    def _parse_decision_result(self, result):
+        if len(result) == 2:
+            utt_score, utt_pred = result
+            utt_metadata = {}
+        elif len(result) == 3:
+            utt_score, utt_pred, utt_metadata = result
+            if utt_metadata is None:
+                utt_metadata = {}
+        else:
+            raise ValueError(
+                "decision_policy.decide() must return (utt_score, utt_pred) "
+                "or (utt_score, utt_pred, metadata_dict)"
+            )
+        return float(utt_score), int(utt_pred), utt_metadata
 
     @abstractmethod
     def transform(self, contexts, forecast_attribute_name, forecast_prob_attribute_name):
